@@ -1,0 +1,175 @@
+name: Moderne Analysis
+
+on:
+  pull_request
+
+jobs:
+  moderne-analysis:
+    runs-on: ubuntu-latest
+    env:
+      PR_NUMBER: ${{ github.event.number }}
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK with cache
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Get Moderne CLI version
+        id: get-moderne-version
+        run: |
+          LATEST_VERSION=$(curl -s --request GET --url "https://api.github.com/repos/moderneinc/moderne-cli-releases/releases/latest" | jq '.tag_name' -r | sed "s/^v//")
+          if [ -z "${LATEST_VERSION}" ]; then
+            echo "Failed to get latest stable version"
+            exit 1
+          fi
+          echo "version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+          echo "Latest Moderne CLI version: $LATEST_VERSION"
+
+      - name: Cache Moderne CLI
+        id: cache-moderne
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/moderne-cli
+            /usr/local/bin/mod
+          key: ${{ runner.os }}-moderne-cli-jar-${{ steps.get-moderne-version.outputs.version }}
+
+      - name: Install Moderne CLI
+        if: steps.cache-moderne.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/moderne-cli
+          cd ~/moderne-cli
+          VERSION="${{ steps.get-moderne-version.outputs.version }}"
+          echo "Downloading Moderne CLI version: ${VERSION}"
+          curl -s --request GET --url "https://repo1.maven.org/maven2/io/moderne/moderne-cli/${VERSION}/moderne-cli-${VERSION}.jar" --output mod.jar
+
+          # Create wrapper script
+          cat > mod << 'EOF'
+          #!/bin/bash
+          java -jar ~/moderne-cli/mod.jar "$@"
+          EOF
+          chmod +x mod
+          sudo mv mod /usr/local/bin/
+          echo "Installed Moderne CLI version: ${VERSION}"
+
+      - name: Get PR changed files
+        id: get-changed-files
+        run: |
+          # Get the base branch
+          BASE_BRANCH="${{ github.event.pull_request.base.ref }}"
+
+          # Fetch the base branch
+          git fetch origin "$BASE_BRANCH"
+
+          # Get files with additions (added lines or new files)
+          # --numstat shows: added_lines deleted_lines filename
+          # Filter for files where added_lines > 0
+          CHANGED_FILES=$(git diff --numstat "origin/$BASE_BRANCH"...HEAD | \
+            awk '$1 != "-" && $1 > 0 {print $3}')
+
+          echo "Files with additions:"
+          echo "$CHANGED_FILES"
+
+          # Save to output
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Generate moderne.yml for PR files
+        run: |
+          CHANGED_FILES="${{ steps.get-changed-files.outputs.files }}"
+
+          # Start building the inclusion pattern
+          INCLUSIONS=""
+          MODULES=""
+          declare -A INCLUDED_FILES
+
+          # Process each changed file
+          while IFS= read -r file; do
+            if [ -n "$file" ]; then
+              # Add the file itself
+              INCLUSIONS="${INCLUSIONS}            ${file}\n"
+              INCLUDED_FILES["$file"]=1
+
+              # Extract module directory (e.g., "core" from "core/src/main/java/...")
+              MODULE=$(echo "$file" | cut -d'/' -f1)
+
+              # Track unique modules
+              if [[ ! " $MODULES " =~ " $MODULE " ]]; then
+                MODULES="$MODULES $MODULE"
+                # Add the module's build.gradle if it exists and not already included
+                if [ -f "$MODULE/build.gradle" ] && [ -z "${INCLUDED_FILES[$MODULE/build.gradle]}" ]; then
+                  INCLUSIONS="${INCLUSIONS}            ${MODULE}/build.gradle\n"
+                  INCLUDED_FILES["$MODULE/build.gradle"]=1
+                fi
+                if [ -f "$MODULE/build.gradle.kts" ] && [ -z "${INCLUDED_FILES[$MODULE/build.gradle.kts]}" ]; then
+                  INCLUSIONS="${INCLUSIONS}            ${MODULE}/build.gradle.kts\n"
+                  INCLUDED_FILES["$MODULE/build.gradle.kts"]=1
+                fi
+              fi
+            fi
+          done <<< "$CHANGED_FILES"
+
+          # Create moderne.yml with dynamic inclusions
+          mkdir -p .moderne
+          cat > .moderne/moderne.yml << EOF
+          build:
+            partitions:
+              - name: pr-files
+                steps:
+                  - type: gradle
+                    inclusion: |-
+          $(echo -e "$INCLUSIONS" | sed 's/^/          /')
+                  - type: resource
+                    inclusion: |-
+          $(echo -e "$INCLUSIONS" | sed 's/^/          /')
+          EOF
+
+          echo "Generated moderne.yml:"
+          cat .moderne/moderne.yml
+
+      - name: Run Moderne recipes
+        id: moderne-run
+        run: |
+          mod build . --no-download || {
+            echo "Build failed. Displaying build log:"
+            BUILD_LOG=$(find .moderne/build/pr-files -name "build.log" -type f 2>/dev/null | head -1)
+            if [ -n "$BUILD_LOG" ] && [ -f "$BUILD_LOG" ]; then
+              cat "$BUILD_LOG"
+            fi
+            exit 1
+          }
+          # TODO can we not cache the installed jars output somehow to be only installing new ones once a day?
+          mod config recipes jar install org.openrewrite.recipe:rewrite-static-analysis:2.18.0
+          mod run . --recipe=org.openrewrite.staticanalysis.CommonStaticAnalysis
+          mod git apply . --last-recipe-run
+
+          # Capture the patch/diff output
+          # The patch is located in .moderne/run/*/fix.patch
+          PATCH_FILE=$(find .moderne/run -name "fix.patch" -type f 2>/dev/null | head -1)
+
+          if [ -n "$PATCH_FILE" ] && [ -f "$PATCH_FILE" ]; then
+            echo "patch_found=true" >> $GITHUB_OUTPUT
+            cp "$PATCH_FILE" moderne-patch.diff
+            echo "Found patch at: $PATCH_FILE"
+          fi
+
+      - name: Post patch as PR suggestions with google code-suggester
+        env:
+          ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: googleapis/code-suggester@v5
+        with:
+          command: review
+          pull_number: ${{ env.PR_NUMBER }}
+          git_dir: "."
