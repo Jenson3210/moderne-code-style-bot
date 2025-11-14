@@ -152,6 +152,12 @@ jobs:
           }
           # TODO can we not cache the installed jars output somehow to be only installing new ones once a day?
           mod config recipes jar install org.openrewrite.recipe:rewrite-static-analysis:2.18.0
+          mod config recipes jar install org.openrewrite:rewrite-java:LATEST
+          
+          # Run FindMissingTypes recipe
+          mod run . --recipe=org.openrewrite.java.search.FindMissingTypes
+
+          # Run CommonStaticAnalysis recipe
           mod run . --recipe=org.openrewrite.staticanalysis.CommonStaticAnalysis
           mod git apply . --last-recipe-run
 
